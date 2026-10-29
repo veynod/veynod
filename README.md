@@ -4,6 +4,7 @@
   <p><strong>A shared blackboard & MCP control plane for multi-agent teams.</strong></p>
   <p>One versioned memory, task hand-offs with leases, quality gates, and human approval — over MCP or REST.</p>
   <p><a href="https://veynod.com"><strong>Website</strong></a> · <a href="https://veynod.com/docs"><strong>Documentation</strong></a> · <a href="https://www.npmjs.com/package/veynod"><strong>NPM Package</strong></a></p>
+  <p><a href="https://glama.ai/mcp/servers/veynod/veynod"><img src="https://glama.ai/mcp/servers/veynod/veynod/badges/score.svg" alt="Veynod on Glama" /></a></p>
 </div>
 
 ---
