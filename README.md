@@ -1,3 +1,4 @@
+<!-- https://veynod.com -->
 <div align="center">
   <h1>Veynod</h1>
   <p><strong>A shared blackboard & MCP control plane for multi-agent teams.</strong></p>
