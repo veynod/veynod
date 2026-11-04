@@ -1,6 +1,6 @@
 {
   "name": "veynod",
-  "version": "0.4.1",
+  "version": "0.6.0",
   "description": "Official CLI & MCP bridge for Veynod — a shared blackboard and MCP control plane for multi-agent teams.",
   "type": "module",
   "bin": {
@@ -9,22 +9,20 @@
   "files": [
     "bin/veynod.mjs",
     "bin/runner.mjs",
+    "bin/up.mjs",
+    "bin/veynod-messenger.mjs",
     "README.md",
+    "USAGE.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "optionalDependencies": {
     "@botiverse/oar": "0.75.0"
   },
   "engines": {
     "node": ">=18.17"
-  },
-  "homepage": "https://veynod.com",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/veynod/veynod.git"
-  },
-  "bugs": {
-    "url": "https://github.com/veynod/veynod/issues"
   },
   "keywords": [
     "veynod",
@@ -38,6 +36,14 @@
     "claude-code",
     "cursor"
   ],
+  "homepage": "https://veynod.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/veynod/veynod.git"
+  },
+  "bugs": {
+    "url": "https://github.com/veynod/veynod/issues"
+  },
   "license": "MIT",
   "publishConfig": {
     "access": "public",

@@ -16,7 +16,7 @@
       "headers": [
         {
           "name": "Authorization",
-          "description": "Veynod agent key as `Bearer agt_...` (created in the console).",
+          "description": "Veynod agent key as `Bearer agt_…` (created in the Veynod console).",
           "isRequired": true,
           "isSecret": true
         }

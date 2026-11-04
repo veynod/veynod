@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-// Copyright (c) 2026 Veynod. MIT licensed.
 // veynod: put your coding agents on a Veynod board in one command.
 //
 //   npx veynod init                 sign in from the browser, configure the MCP
@@ -34,7 +33,7 @@ import { dirname, join, posix } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-export const VERSION = "0.4.1";
+export const VERSION = "0.6.0";
 const SEAL_INFO = Buffer.from("veynod-cli-v1");
 // DER prefix of an X25519 SubjectPublicKeyInfo; the 32 raw key bytes follow.
 const X25519_SPKI_PREFIX = Buffer.from("302a300506032b656e032100", "hex");
@@ -48,6 +47,7 @@ const dim = paint("2");
 const bold = paint("1");
 const green = paint("32");
 const red = paint("31");
+const yellow = paint("33");
 const print = (line = "") => process.stdout.write(`${line}\n`);
 
 // ------------------------------------------------------------------ crypto
@@ -239,10 +239,11 @@ export function configureClaudeCode(
 
 // -------------------------------------------------------------------- http
 
-async function call(host, path, body) {
+async function call(host, path, body, key = "") {
   const response = await fetch(new URL(path, host), {
     method: "POST",
-    headers: { "Content-Type": "application/json", "User-Agent": `veynod-cli/${VERSION}` },
+    headers: { "Content-Type": "application/json", "User-Agent": `veynod-cli/${VERSION}`,
+      ...(key ? { Authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(20000),
   });
@@ -311,11 +312,17 @@ export function parseArgs(argv) {
     dryRun: false,
     subcommand: null,
     runner: false,
-    runtime: process.env.VEYNOD_RUNTIME || "claude",
+    // Empty: use whichever of Claude Code and Codex this computer has.
+    runtime: process.env.VEYNOD_RUNTIME || "",
     slots: Number(process.env.VEYNOD_SLOTS) || 1,
     repos: (process.env.VEYNOD_REPOS || "").split(",").map((item) => item.trim()).filter(Boolean),
     diskMb: Number(process.env.VEYNOD_DISK_MB) || 5120,
     gitBase: process.env.VEYNOD_GIT_BASE || "https://github.com/",
+    runTasks: false,
+    yes: false,
+    name: "",
+    fresh: false,
+    service: true,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -339,11 +346,17 @@ export function parseArgs(argv) {
     else if (arg === "--no-heartbeat") options.heartbeat = false;
     else if (arg === "--dry-run") options.dryRun = true;
     else if (arg === "--runner") options.runner = true;
+    else if (arg === "--agent") options.agent = value();
     else if (arg === "--runtime") options.runtime = value();
     else if (arg === "--slots") options.slots = Number(value());
     else if (arg === "--repo") options.repos.push(...value().split(",").map((item) => item.trim()).filter(Boolean));
     else if (arg === "--disk-mb") options.diskMb = Number(value());
     else if (arg === "--git-base") options.gitBase = value();
+    else if (arg === "--run-tasks") options.runTasks = true;
+    else if (arg === "--yes" || arg === "-y") options.yes = true;
+    else if (arg === "--name") options.name = value();
+    else if (arg === "--fresh") options.fresh = true;
+    else if (arg === "--no-service") options.service = false;
     else if (!arg.startsWith("-") && !options.command) options.command = arg;
     else if (!arg.startsWith("-") && options.command === "service" && !options.subcommand) {
       options.subcommand = arg;
@@ -356,7 +369,7 @@ export function parseArgs(argv) {
   if (!Number.isInteger(options.slots) || options.slots < 1 || options.slots > 64) {
     throw new Error("--slots must be a whole number from 1 to 64");
   }
-  if (!["claude", "codex", "custom"].includes(options.runtime)) {
+  if (!["", "claude", "codex", "custom"].includes(options.runtime)) {
     throw new Error(`unknown runtime ${options.runtime} (claude, codex or custom)`);
   }
   options.repos = [...new Set(options.repos)];
@@ -370,6 +383,16 @@ export function parseArgs(argv) {
 const HELP = `${bold("veynod")} ${VERSION}: put your coding agents on a Veynod board
 
 ${bold("Usage")}
+  npx veynod up [--run-tasks] [--repo owner/name,...] [--runtime claude|codex|custom]
+                [--slots N] [--name NAME] [--client ...] [--host URL] [--yes] [--fresh]
+                [--no-service] [--dry-run]
+      One command: connects this computer (one console approval for all its
+      identities), wires your MCP clients, installs the hub service and runs the
+      doctor. --no-service leaves starting \`veynod hub\` to your own supervisor.
+  veynod hub      The service up installs: every identity in ~/.veynod/config.json,
+                  one stream each, as runners with --run-tasks, else as listeners.
+  veynod doctor   What is missing on this computer and on the board, with the fix.
+
   npx veynod init [--client claude-code,cursor,claude-desktop,print] [--host URL] [--no-open]
 
   npx veynod listen [--exec CMD] [--key KEY | --key-file PATH] [--host URL] [--once]
@@ -382,26 +405,29 @@ ${bold("Usage")}
                     [--exec CMD] [--host URL] [--dry-run]
 
 ${bold("What listen does")}
-  Holds the inbox stream open, so the board shows this agent online and pokes
-  (assignments, mentions, reviews) arrive within seconds. Each poke is printed
-  as one JSON line, or handed to --exec CMD (JSON on stdin and in VEYNOD_POKE).
-  It reconnects with backoff and resumes after the last poke it saw, so a
-  restart neither drops nor repeats one. The key comes from --key, --key-file
-  or VEYNOD_KEY. --once exits after the first poke (for scripts). Every 30 s it
-  also sends a loop heartbeat, so the board shows the agent offline within
-  90 s of this process dying, even when a proxy keeps the stream half-open.
+  For an agent in an editor, not a computer that runs tasks: holds the inbox
+  stream open so the board shows the agent online and messages and mentions
+  arrive within seconds. Each one is printed as one JSON line, or handed to
+  --exec CMD (JSON on stdin and in VEYNOD_POKE). It reconnects with backoff and
+  resumes after the last one it saw. HTTP 429 waits for Retry-After. The key
+  comes from --key, --key-file or VEYNOD_KEY. --once exits after the first one.
+  Every 30 s it sends a loop heartbeat, so the board shows the agent offline
+  within 90 s of this process dying. Work is never placed through listen.
 
 ${bold("What runner does")}
-  Makes this computer run agents for the board. It tells the platform what the
-  computer can do (system, Claude Code / Codex with models and quota, --slots
-  tasks at once, the --repo repositories it may work on) and sends a heartbeat
-  every 30 s. When the platform places a task here it starts the runtime in a
-  fresh git worktree on branch veynod/<task> (pushes of any other branch are
-  refused) with a prompt to claim and do the task, and cleans up afterwards.
-  Three failed starts leave the task for another computer. --runtime custom
-  runs --exec CMD with the prompt in VEYNOD_PROMPT. Receipts are written to
-  ~/.veynod/runner-receipts.jsonl. Use OAR (npm i -g @botiverse/oar, Node 24+)
-  for quota-aware runs; without it the runtime's own CLI is used.
+  Puts this computer on the Loop. It tells the platform what the computer can
+  do (system, Claude Code / Codex with models and quota, --slots tasks at once,
+  the --repo repositories it may work on), heartbeats every 30 s, and holds the
+  computer's nerve socket: every placement arrives there and is answered at
+  once. Each placement runs in its own worker process. A task with a
+  repository runs in a Kernel worktree lease and is submitted through the
+  Kernel (verification_gate, then merge_coordinator); the host checkout is
+  never edited. Work without a repository runs in a scratch directory. Three
+  failed starts leave the task for another computer. Without --runtime it uses
+  whichever of Claude Code and Codex is installed (the command-line tool, not
+  the desktop app). --runtime custom runs --exec CMD with the prompt in
+  VEYNOD_PROMPT. Receipts are written to ~/.veynod/runner-receipts.jsonl. Use
+  OAR (npm i -g @botiverse/oar, Node 24+) for quota-aware runs.
 
 ${bold("What service does")}
   install    Runs listen in the background: a systemd user service (Linux), a
@@ -441,22 +467,29 @@ function openBrowser(url) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function init(options) {
-  const out = (line = "") => process.stdout.write(`${line}\n`);
-  out();
-  out(`  ${violet("◆")} ${bold("Veynod")} ${dim(`init · ${options.host}`)}`);
-  out();
-
-  const detected = detectClients();
-  const clients = selectedClients(options.clients, detected);
-  out(`  ${dim("Clients")}  ${clients.join(", ")}${options.clients.length ? "" : dim("  (found on this computer)")}`);
-
+/** The console's device flow: a code you approve, a key sealed to this terminal. */
+/**
+ * The console's device flow. `identities` ({name, role_scope, why}) asks for
+ * every identity in one approval (servers from 3.64): the first is this
+ * terminal's own agent, the rest come back in `extra`, each with its own key.
+ * `legacy` is true when the server predates that and minted only one.
+ */
+export async function connect(options, { clients = [], label = hostname(), out = () => {}, identities = [] } = {}) {
   const { privateKey, publicRaw } = makeKeyPair();
-  const started = await call(options.host, "/v1/auth/cli/sessions", {
+  const body = {
     public_key: publicRaw.toString("base64"),
-    client_label: hostname().slice(0, 64),
+    client_label: String(label).slice(0, 64),
     clients: clients.map((item) => (item === "print" ? "other" : item)),
-  });
+  };
+  let started;
+  let legacy = false;
+  try {
+    started = await call(options.host, "/v1/auth/cli/sessions", identities.length ? { ...body, identities } : body);
+  } catch (error) {
+    if (!identities.length || error.status !== 422) throw error;
+    legacy = true;
+    started = await call(options.host, "/v1/auth/cli/sessions", body);
+  }
   const link = `${options.host}/dashboard/cli/?code=${encodeURIComponent(started.user_code)}`;
   out();
   out(`  Your code   ${bold(violet(started.user_code))}`);
@@ -485,12 +518,17 @@ async function init(options) {
     if (polled.status === "expired") break;
   }
   if (process.stdout.isTTY) process.stdout.write("\r\x1b[2K");
-  if (!approved) throw new Error("the code expired before it was approved; run npx veynod init again");
+  if (!approved) throw new Error("the code expired before it was approved; run the command again");
 
   const key = openSealed(approved.sealed_key, privateKey, publicRaw);
+  const extra = (approved.identities || []).map((item) => ({ name: item.name, agent_id: item.agent_signature,
+    role_scope: item.role_scope, key: openSealed(item.sealed_key, privateKey, publicRaw) }));
   const mcpUrl = new URL(approved.mcp_path || "/mcp/", options.host).href;
-  out(`  ${green("✓")} Approved: ${bold(approved.agent_signature)} in ${bold(approved.workspace.name)}`);
+  return { key, approved, mcpUrl, extra, legacy };
+}
 
+/** Adds Veynod with this key to each MCP client; returns what was configured. */
+export function wireClients(clients, mcpUrl, key, out = () => {}) {
   const configured = [];
   for (const client of clients) {
     try {
@@ -512,6 +550,22 @@ async function init(options) {
     }
   }
   for (const item of configured) out(`  ${green("✓")} Configured ${item}`);
+  return configured;
+}
+
+async function init(options) {
+  const out = (line = "") => process.stdout.write(`${line}\n`);
+  out();
+  out(`  ${violet("◆")} ${bold("Veynod")} ${dim(`init · ${options.host}`)}`);
+  out();
+
+  const detected = detectClients();
+  const clients = selectedClients(options.clients, detected);
+  out(`  ${dim("Clients")}  ${clients.join(", ")}${options.clients.length ? "" : dim("  (found on this computer)")}`);
+
+  const { key, approved, mcpUrl } = await connect(options, { clients, label: hostname(), out });
+  out(`  ${green("✓")} Approved: ${bold(approved.agent_signature)} in ${bold(approved.workspace.name)}`);
+  const configured = wireClients(clients, mcpUrl, key, out);
 
   try {
     await verify(mcpUrl, key);
@@ -534,6 +588,8 @@ async function init(options) {
 
 export function parseSse(buffer) {
   // Returns [events, rest]: complete "\n\n"-terminated frames and the remainder.
+  // Comment lines (": ping") are heartbeats, not events. Emitting them as an
+  // empty message made listen throw on JSON.parse and reconnect every beat.
   const events = [];
   let rest = buffer.replace(/\r\n/g, "\n");
   let cut;
@@ -541,6 +597,7 @@ export function parseSse(buffer) {
     const block = rest.slice(0, cut);
     rest = rest.slice(cut + 2);
     const event = { event: "message", data: "", id: null };
+    let fieldSeen = false;
     for (const line of block.split("\n")) {
       if (!line || line.startsWith(":")) continue;
       const at = line.indexOf(":");
@@ -549,21 +606,29 @@ export function parseSse(buffer) {
       if (field === "event") event.event = value;
       else if (field === "data") event.data += (event.data ? "\n" : "") + value;
       else if (field === "id") event.id = value;
+      else continue;
+      fieldSeen = true;
     }
-    events.push(event);
+    if (fieldSeen) events.push(event);
   }
   return [events, rest];
 }
 
+// Honour VEYNOD_HOME/HOME (node's homedir() ignores HOME on Windows).
+function defaultHome() {
+  return process.env.VEYNOD_HOME || process.env.HOME || homedir();
+}
+
 function cursorFile(host, key) {
   const tag = Buffer.from(`${host}|${key.slice(-12)}`).toString("base64url").slice(0, 24);
-  const directory = process.env.VEYNOD_STATE_DIR || join(homedir(), ".veynod");
+  const directory = process.env.VEYNOD_STATE_DIR || join(defaultHome(), ".veynod");
   return join(directory, `listen-${tag}.json`);
 }
 
 function loadCursor(path) {
   try {
-    return Number(JSON.parse(readFileSync(path, "utf8")).last_seq) || null;
+    const saved = JSON.parse(readFileSync(path, "utf8"));
+    return Number(saved.last_seq ?? saved.last_event_id) || null;
   } catch {
     return null;
   }
@@ -571,8 +636,137 @@ function loadCursor(path) {
 
 function saveCursor(path, seq) {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(`${path}.tmp`, JSON.stringify({ last_seq: seq }), { mode: 0o600 });
+  const body = JSON.stringify({ last_seq: seq, last_event_id: String(seq) });
+  writeFileSync(`${path}.tmp`, body, { mode: 0o600 });
   renameSync(`${path}.tmp`, path);
+}
+
+// Reconnect policy. A short-lived HTTP 200 used to reset the delay to 1s, so
+// a proxy that cut the stream every minute never backed off. Reset only after
+// the stream has been live for a minute, or when the server planned the close.
+export const RECONNECT_CAP_MS = 60_000;
+export const STABLE_MS = 60_000;
+export const PLANNED_JITTER_MS = 3_000;
+export const DEFAULT_RETRY_AFTER_MS = 60_000;
+
+export function parseRetryAfter(header, now = Date.now()) {
+  if (header == null || String(header).trim() === "") return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  const when = Date.parse(String(header));
+  if (Number.isFinite(when)) return Math.max(0, when - now);
+  return null;
+}
+
+async function readRetryAfterMs(response, now) {
+  const raw = typeof response.headers?.get === "function"
+    ? response.headers.get("retry-after")
+    : response.headers?.["retry-after"];
+  const header = parseRetryAfter(raw, now);
+  if (header != null) return header;
+  if (typeof response.json !== "function") return null;
+  try {
+    const body = await response.json();
+    const ms = body?.error?.retry_after_ms;
+    if (typeof ms === "number" && Number.isFinite(ms)) return Math.max(0, ms);
+  } catch {
+    // A 429 with an empty body still waits the default.
+  }
+  return null;
+}
+
+export function isPlannedClose(event) {
+  if (!event) return false;
+  if (event.event === "planned-close") return true;
+  if (event.event !== "closed" || !event.data) return false;
+  try {
+    const data = JSON.parse(event.data);
+    return data?.reason === "max_lifetime" || data?.planned === true;
+  } catch {
+    return false;
+  }
+}
+
+export function nextReconnect({ attempt = 0, connectedAt = 0 } = {}, {
+  reason = "network", now = Date.now(), retryAfterMs = null, random = Math.random,
+} = {}) {
+  if (reason === "hook") {
+    return { attempt, delayMs: 1_000 + Math.floor(random() * 500), reset: false };
+  }
+  const lived = connectedAt > 0 ? Math.max(0, now - connectedAt) : 0;
+  if (reason === "planned-close") {
+    return { attempt: 0, delayMs: 250 + Math.floor(random() * PLANNED_JITTER_MS), reset: true };
+  }
+  if (lived >= STABLE_MS) {
+    return { attempt: 0, delayMs: 1_000 + Math.floor(random() * 500), reset: true };
+  }
+  if (reason === "429") {
+    const base = retryAfterMs == null ? DEFAULT_RETRY_AFTER_MS : Math.max(0, retryAfterMs);
+    const jitter = Math.floor(random() * 1_000);
+    return { attempt: attempt + 1, delayMs: Math.min(RECONNECT_CAP_MS, base + jitter), reset: false };
+  }
+  const next = attempt + 1;
+  const exp = Math.min(RECONNECT_CAP_MS, 1_000 * 2 ** Math.min(next - 1, 16));
+  return {
+    attempt: next,
+    delayMs: Math.min(RECONNECT_CAP_MS, exp + Math.floor(random() * 500)),
+    reset: false,
+  };
+}
+
+function listenStateDir() {
+  return process.env.VEYNOD_STATE_DIR || join(defaultHome(), ".veynod");
+}
+
+export function processAlive(pid, kill = (id, signal) => process.kill(id, signal)) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM: the process exists but we may not signal it. ESRCH: it is gone.
+    return error?.code === "EPERM";
+  }
+}
+
+/** Claim listen.pid. A dead pid (kill -0 -> ESRCH) is overwritten. */
+export function acquireListenPid({ dir, pid = process.pid, alive = processAlive } = {}) {
+  if (!dir) throw new Error("listen pid directory is required");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, "listen.pid");
+  const release = () => {
+    try {
+      if (Number(readFileSync(path, "utf8").trim()) === pid) unlinkSync(path);
+    } catch {
+      // already gone
+    }
+  };
+  for (let i = 0; i < 2; i += 1) {
+    try {
+      writeFileSync(path, `${pid}\n`, { flag: "wx", mode: 0o600 });
+      return release;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      let held = NaN;
+      try {
+        held = Number(readFileSync(path, "utf8").trim());
+      } catch {
+        held = NaN;
+      }
+      if (Number.isInteger(held) && held !== pid && alive(held)) {
+        throw Object.assign(
+          new Error(`another listen (pid ${held}) is already running (${path})`),
+          { code: "listen_running" },
+        );
+      }
+      try {
+        unlinkSync(path);
+      } catch (unlinkError) {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      }
+    }
+  }
+  throw new Error(`could not claim ${path}`);
 }
 
 function runHook(command, poke) {
@@ -631,43 +825,103 @@ export function startHeartbeat(host, key, { every = HEARTBEAT_MS, say = () => {}
   return stop;
 }
 
+/**
+ * `veynod runner`: put this computer on the Loop in the foreground (the
+ * `veynod up` service does the same for every identity it keeps).
+ */
+async function runComputerForeground(options) {
+  const { runComputer } = await import("./veynod-messenger.mjs");
+  const say = (text) => process.stderr.write(`  ${dim(new Date().toISOString())} ${text}\n`);
+  const messenger = await runComputer(options, { say, version: VERSION });
+  const stop = () => {
+    messenger.stop();
+    process.exit(0);
+  };
+  process.once("SIGTERM", stop);
+  process.once("SIGINT", stop);
+  await new Promise(() => {});
+}
+
 async function listen(options) {
   if (!options.key) throw new Error("listen needs an agent key: --key, --key-file or VEYNOD_KEY");
   const say = (text) => process.stderr.write(`  ${dim(new Date().toISOString())} ${text}\n`);
+  const releasePid = options.managePid
+    ? acquireListenPid({ dir: options.stateDir || listenStateDir() })
+    : () => {};
   const stopHeartbeat = options.heartbeat ? startHeartbeat(options.host, options.key, { say }) : () => {};
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    stopHeartbeat();
+    releasePid();
+  };
+  const onStop = () => {
+    release();
+    process.exit(0);
+  };
+  if (options.managePid) {
+    process.once("SIGTERM", onStop);
+    process.once("SIGINT", onStop);
+  }
   try {
     return await follow(options, say);
   } finally {
-    stopHeartbeat();
+    if (options.managePid) {
+      process.removeListener("SIGTERM", onStop);
+      process.removeListener("SIGINT", onStop);
+    }
+    release();
   }
 }
 
-async function follow(options, say) {
+export async function follow(options, say = () => {}, deps = {}) {
+  const fetchImpl = deps.fetchImpl || fetch;
+  const sleepImpl = deps.sleepImpl || sleep;
+  const now = deps.now || Date.now;
+  const random = deps.random || Math.random;
   const statePath = cursorFile(options.host, options.key);
   let lastSeq = loadCursor(statePath);
-  let delay = 1000;
+  // Not reset on HTTP 200. A stream that dies before STABLE_MS keeps climbing.
+  let attempt = 0;
   for (;;) {
     const controller = new AbortController();
+    let connectedAt = 0;
     try {
       const headers = { Authorization: `Bearer ${options.key}`, Accept: "text/event-stream" };
       if (lastSeq) headers["Last-Event-ID"] = String(lastSeq);
-      const response = await fetch(`${options.host}/v1/inbox/stream`, { headers, signal: controller.signal });
+      const response = await fetchImpl(`${options.host}/v1/inbox/stream`, { headers, signal: controller.signal });
       if (response.status === 401 || response.status === 403) {
         const body = await response.json().catch(() => ({}));
         throw Object.assign(new Error(body?.error?.message || `refused (${response.status})`), { fatal: true });
       }
-      if (!response.ok || !response.body) throw new Error(`stream answered ${response.status}`);
+      if (!response.ok || !response.body) {
+        const retryAfterMs = response.status === 429 ? await readRetryAfterMs(response, now()) : null;
+        throw Object.assign(new Error(`stream answered ${response.status}`), {
+          reason: response.status === 429 ? "429" : "http",
+          retryAfterMs,
+        });
+      }
+      connectedAt = now();
       say(`${green("online")} ${options.host}${lastSeq ? ` (resuming after ${lastSeq})` : ""}`);
-      delay = 1000;
       const decoder = new TextDecoder();
       let buffer = "";
+      let endReason = "ended";
       for await (const chunk of response.body) {
         buffer += decoder.decode(chunk, { stream: true });
         const [events, rest] = parseSse(buffer);
         buffer = rest;
         for (const event of events) {
-          if (event.event === "closed") throw new Error(`server closed the stream: ${event.data}`);
-          if (event.event !== "poke") continue;
+          if (isPlannedClose(event)) {
+            endReason = "planned-close";
+            break;
+          }
+          if (event.event === "closed") {
+            throw Object.assign(new Error(`server closed the stream: ${event.data}`), { reason: "closed" });
+          }
+          // Pokes and direct messages both reach the hook; "message" frames carry the
+          // conversation pointer in poke.message. Comment heartbeats have no data.
+          if ((event.event !== "poke" && event.event !== "message") || !event.data) continue;
           const poke = JSON.parse(event.data);
           const seq = Number(event.id || poke.event_seq);
           if (lastSeq && seq <= lastSeq) continue; // seen before a reconnect
@@ -681,7 +935,7 @@ async function follow(options, say) {
                 process.stderr.write(`  ${red("✗")} ${message}; cursor kept at ${lastSeq ?? "start"}\n`);
                 return 1;
               }
-              throw new Error(message);
+              throw Object.assign(new Error(message), { reason: "hook" });
             }
           } else {
             process.stdout.write(`${JSON.stringify(poke)}\n`);
@@ -693,14 +947,29 @@ async function follow(options, say) {
             return 0;
           }
         }
+        if (endReason === "planned-close") break;
       }
-      throw new Error("stream ended");
+      throw Object.assign(
+        new Error(endReason === "planned-close" ? "server planned close" : "stream ended"),
+        { reason: endReason },
+      );
     } catch (error) {
       if (error.fatal) throw error;
       if (error.name === "AbortError" && options.once) return 0;
-      say(`${red("offline")} ${error.message}; retrying in ${Math.round(delay / 1000)}s`);
-      await sleep(delay + Math.floor(Math.random() * 500));
-      delay = Math.min(delay * 2, 60_000);
+      const decision = nextReconnect(
+        { attempt, connectedAt },
+        {
+          reason: error.reason || "network",
+          now: now(),
+          retryAfterMs: error.retryAfterMs ?? null,
+          random,
+        },
+      );
+      attempt = decision.attempt;
+      const seconds = Math.max(1, Math.round(decision.delayMs / 1000));
+      const label = error.reason === "planned-close" ? dim("reconnecting") : red("offline");
+      say(`${label} ${error.message}; retrying in ${seconds}s`);
+      await sleepImpl(decision.delayMs);
     }
   }
 }
@@ -722,9 +991,9 @@ export function listenArguments({ script, host, keyFile, exec }) {
   return [script, "listen", "--host", host, "--key-file", keyFile, ...(exec ? ["--exec", exec] : [])];
 }
 
-export function runnerArguments({ script, host, keyFile, exec, runtime = "claude", slots = 1, repos = [],
+export function runnerArguments({ script, host, keyFile, exec, runtime = "", slots = 1, repos = [],
   diskMb = 5120 }) {
-  return [script, "runner", "--host", host, "--key-file", keyFile, "--runtime", runtime,
+  return [script, "runner", "--host", host, "--key-file", keyFile, ...(runtime ? ["--runtime", runtime] : []),
     "--slots", String(slots), ...(repos.length ? ["--repo", repos.join(",")] : []),
     "--disk-mb", String(diskMb), ...(exec ? ["--exec", exec] : [])];
 }
@@ -735,11 +1004,18 @@ const SERVICE_NAMES = {
     title: "Veynod listen: keep this agent online and receive pokes" },
   runner: { unit: "veynod-runner", label: "com.veynod.runner", task: "VeynodRunner", log: "runner.log",
     title: "Veynod runner: run agents for the board on this computer" },
+  hub: { unit: "veynod-hub", label: "com.veynod.hub", task: "VeynodHub", log: "hub.log",
+    title: "Veynod hub: this computer's agents on the board (veynod up)" },
 };
+
+/** The hub reads its identities from ~/.veynod/config.json. */
+export function hubArguments({ script }) {
+  return [script, "hub"];
+}
 
 export function servicePlan(action, {
   os = platform(),
-  home = homedir(),
+  home = defaultHome(),
   node = process.execPath,
   script = fileURLToPath(import.meta.url),
   host,
@@ -751,9 +1027,10 @@ export function servicePlan(action, {
 } = {}) {
   // --exec runs from the directory install ran in, so relative hooks resolve.
   const names = SERVICE_NAMES[mode];
-  const args = mode === "runner"
-    ? runnerArguments({ script, host, keyFile, exec, ...runner })
-    : listenArguments({ script, host, keyFile, exec });
+  const args = mode === "hub" ? hubArguments({ script })
+    : mode === "runner"
+      ? runnerArguments({ script, host, keyFile, exec, ...runner })
+      : listenArguments({ script, host, keyFile, exec });
   const stateDir = os === "win32" ? join(home, ".veynod") : posix.join(home, ".veynod");
   const log = os === "win32" ? join(stateDir, names.log) : posix.join(stateDir, names.log);
   const plan = { os, files: [], remove: [], commands: [], notes: [] };
@@ -769,6 +1046,9 @@ export function servicePlan(action, {
         "[Service]",
         `WorkingDirectory=${systemdQuote(cwd)}`,
         `ExecStart=${[node, ...args].map(systemdQuote).join(" ")}`,
+        ...(mode === "listen"
+          ? ["# listen retries network errors and HTTP 429 itself; this covers crashes and SIGKILL."]
+          : []),
         "Restart=always",
         "RestartSec=5",
         "Environment=NO_COLOR=1",
@@ -964,7 +1244,7 @@ function audit() {
 
 function serviceKeyFile(options) {
   if (options.keyFile) return options.keyFile;
-  const path = join(homedir(), ".veynod", options.runner ? "runner.key" : "listen.key");
+  const path = join(defaultHome(), ".veynod", options.runner ? "runner.key" : "listen.key");
   if (options.key) {
     if (!options.dryRun) {
       mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -996,7 +1276,24 @@ async function service(options) {
     plan.notes.unshift("This copy runs from the npx cache, which can be cleaned: install it first with "
       + "`npm install -g veynod`, then run `veynod service install` again.");
   }
-  if (options.dryRun) {
+  return applyServicePlan(plan, action, { dryRun: options.dryRun });
+}
+
+/** True when this copy is running out of npm's throwaway npx cache. */
+export function isNpxCachePath(script) {
+  return /[\\/]_npx[\\/]/.test(String(script)) || /[\\/]npm-cache[\\/]_npx[\\/]/.test(String(script));
+}
+
+/** A failed plan command, quoted so it can be pasted into cmd.exe and run by hand. */
+export function manualCommand(command, args) {
+  return [command, ...args]
+    .map((word) => (/[\s"]/.test(word) ? `"${word.replace(/"/g, '""')}"` : word))
+    .join(" ");
+}
+
+/** Writes a service plan's files and runs its commands (or prints them for --dry-run). */
+export function applyServicePlan(plan, action, { dryRun = false } = {}) {
+  if (dryRun) {
     for (const file of plan.files) print(`${bold("write")} ${file.path}\n${file.content}`);
     for (const path of plan.remove) print(`${bold("remove")} ${path}`);
     for (const command of plan.commands) print(`${bold("run")} ${command.join(" ")}`);
@@ -1016,7 +1313,18 @@ async function service(options) {
       const benign = action === "install" && args[0] === "unload";
       if (!benign) {
         failed += 1;
-        process.stderr.write(`  ${red("✗")} ${command} ${args.join(" ")}: ${error.message.split("\n")[0]}\n`);
+        // EPERM means the child never started: on Windows that is a local
+        // security agent refusing to let node spawn it, not a bad command. A
+        // raw "spawnSync schtasks EPERM" leaves the user with nothing to do, so
+        // say what happened and print the command to run by hand.
+        if (error.code === "EPERM" && process.platform === "win32") {
+          process.stderr.write(`  ${red("✗")} ${command} ${args.join(" ")}: blocked before it ran `
+            + "(local security software refuses to let node start it)\n");
+          process.stderr.write(`      Run it yourself in cmd.exe:\n`);
+          process.stderr.write(`        ${manualCommand(command, args)}\n`);
+        } else {
+          process.stderr.write(`  ${red("✗")} ${command} ${args.join(" ")}: ${error.message.split("\n")[0]}\n`);
+        }
       }
     }
   }
@@ -1032,6 +1340,151 @@ async function service(options) {
     for (const note of plan.notes) print(dim(`  ${note}`));
   }
   return failed ? 1 : 0;
+}
+
+// --------------------------------------------------------------------- up
+
+function ask(question) {
+  return new Promise((resolve) => {
+    process.stdout.write(question);
+    process.stdin.setEncoding("utf8");
+    process.stdin.once("data", (data) => {
+      process.stdin.pause();
+      resolve(String(data).trim().toLowerCase());
+    });
+  });
+}
+
+function printChecks(checks) {
+  for (const item of checks) {
+    const mark = item.ok ? green("✓") : item.required ? red("✗") : violet("!");
+    print(`${mark} ${item.text}${item.ok || !item.fix ? "" : dim(`  → ${item.fix}`)}`);
+  }
+}
+
+/** veynod up: connect this computer, wire its agents, install the hub, run the doctor. */
+async function up(options) {
+  const { doctor, doctorOk, loadConfig, reuseIdentities, saveConfig, storeKey, upPlan } = await import("./up.mjs");
+  const out = (line = "") => process.stdout.write(`${line}\n`);
+  out();
+  out(`  ${violet("◆")} ${bold("Veynod")} ${dim(`up · ${options.host}`)}`);
+  const clients = selectedClients(options.clients, detectClients());
+  if (!options.runTasks && !options.yes && process.stdin.isTTY && !options.dryRun) {
+    const answer = await ask("  Let this computer run board tasks unattended? (y/N) ");
+    options.runTasks = answer === "y" || answer === "yes";
+  }
+  const plan = upPlan(options, { clients });
+  const script = fileURLToPath(import.meta.url);
+  const service = servicePlan("install", { host: options.host, script, mode: "hub" });
+  if (options.dryRun) {
+    out(JSON.stringify({ ...plan, service: { files: service.files.map((file) => file.path),
+      commands: service.commands } }, null, 2));
+    return 0;
+  }
+  if (plan.run_tasks && options.runtime !== "custom") {
+    // Before any key is asked for: a computer with no runtime would come online and do nothing.
+    const { chooseRuntime, inventory, installSteps, RUNTIME_NAMES } = await import("./runner.mjs");
+    const picked = chooseRuntime(options.runtime, await inventory());
+    if (!picked.runtime) {
+      out();
+      out(`  ${red("✗")} ${picked.reason}`);
+      out("      Install one, sign in, then run this again:");
+      for (const line of installSteps(options.runtime || null)) out(`        ${line}`);
+      out();
+      return 1;
+    }
+    options.runtime = picked.runtime;
+    out(`  ${green("✓")} ${RUNTIME_NAMES[picked.runtime]} runs this computer's tasks`);
+  }
+  const previous = loadConfig();
+  const reused = reuseIdentities(plan, previous, { host: options.host, fresh: options.fresh });
+  const identities = reused.identities;
+  let missing = reused.missing;
+  for (const kept of identities) out(`  ${green("✓")} ${kept.agent_id} is already connected`);
+  // One approval for every identity still missing; an older server mints one
+  // per code, so the rest are asked for again, one code each.
+  let legacy = false;
+  while (missing.length) {
+    const asked = legacy ? missing.slice(0, 1) : missing;
+    out();
+    for (const item of asked) out(`  ${bold(item.label)} (${item.wants_role}): ${item.why}.`);
+    if (asked.length > 1) out(`  One approval in the console connects ${asked.length === 2 ? "both" : "all of them"}.`);
+    else if (legacy) out(`  In the console, approve it with role ${bold(asked[0].wants_role)}.`);
+    const result = await connect(options, { clients: asked[0].role === "computer" ? clients : [],
+      label: asked[0].label, out,
+      identities: legacy ? [] : asked.map((item) => ({ name: item.label, role_scope: item.wants_role, why: item.why })) });
+    const got = [{ wanted: asked[0], agentId: result.approved.agent_signature, key: result.key }];
+    for (const item of result.extra) {
+      const wanted = asked.find((entry) => entry !== asked[0] && entry.label === item.name);
+      if (wanted) got.push({ wanted, agentId: item.agent_id, key: item.key });
+    }
+    for (const { wanted, agentId, key } of got) {
+      identities.push({ role: wanted.role, agent_id: agentId, key_file: storeKey(agentId, key),
+        workspace: result.approved.workspace?.name ?? null });
+      out(`  ${green("✓")} Approved: ${bold(agentId)} in ${bold(result.approved.workspace?.name ?? "the workspace")}`);
+      if (wanted.role === "computer") wireClients(clients, result.mcpUrl, key, out);
+      try {
+        await call(options.host, "/v1/agents/register", { agent_id: agentId,
+          capabilities: wanted.role === "review" ? ["review"] : [options.runtime] }, key);
+      } catch {
+        // already registered, or registration is not open to this token
+      }
+    }
+    const left = missing.filter((item) => !got.some((entry) => entry.wanted === item));
+    if (result.legacy || legacy) {
+      legacy = true;
+      missing = left;
+    } else {
+      // What the owner unticked stays unconnected; the doctor says what that costs.
+      for (const item of left) out(`  ${yellow("!")} ${item.label} was not approved`);
+      missing = [];
+    }
+  }
+  saveConfig({ host: options.host, run_tasks: plan.run_tasks, runtime: options.runtime, exec: options.exec,
+    slots: options.slots, repos: options.repos, identities: [...identities, ...reused.parked] });
+  out();
+  let serviceInstalled;
+  if (options.service && isNpxCachePath(script)) {
+    // A service pointed into npm's npx cache breaks the first time npm cleans
+    // it, and it breaks silently (the launcher just restarts a missing file).
+    out();
+    out(`  ${red("✗")} The hub service was not installed: this copy runs from the npx cache,`);
+    out(`      which npm may clean at any time. Install it once, then run this again:`);
+    out(`        ${bold("npm install -g veynod")}`);
+    out(`        ${bold("veynod up --run-tasks --repo owner/name")}`);
+    out(`      ${dim("The identities approved above are kept, so this does not ask again.")}`);
+    serviceInstalled = () => false;
+  } else if (options.service) {
+    const installed = applyServicePlan(service, "install") === 0;
+    serviceInstalled = () => installed && service.files.every((file) => existsSync(file.path));
+  } else {
+    out(`  ${dim("No service installed (--no-service): run `veynod hub` under your own supervisor.")}`);
+  }
+  out();
+  out(`  ${bold("Doctor")}`);
+  const checks = await settledDoctor(() => doctor({ serviceInstalled }), { doctorOk });
+  printChecks(checks);
+  out();
+  return doctorOk(checks) ? 0 : 1;
+}
+
+// The board checks a hub's hello turns green; nothing else is worth waiting for.
+const AFTER_HELLO = new Set(["board:hosts", "board:builder", "board:reviewer"]);
+
+/**
+ * The hub just started: give it time to say hello before the board's checks
+ * count. Only the checks its hello answers are waited on; anything else red
+ * (on this computer, or automation on the board) is answered at once.
+ */
+export async function settledDoctor(run, { doctorOk, tries = 15, waitMs = 2_000 } = {}) {
+  let checks = await run();
+  for (let attempt = 1; attempt < tries && !doctorOk(checks); attempt += 1) {
+    const red = checks.filter((item) => !item.ok && item.required);
+    if (!red.every((item) => AFTER_HELLO.has(item.id))) break;
+    await sleep(waitMs);
+    checks = await run();
+  }
+  return checks;
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -1067,9 +1520,25 @@ export async function main(argv = process.argv.slice(2)) {
   if (options.command === "runner" && !options.help) {
     try {
       if (!options.key) throw new Error("runner needs the runner's agent key: --key, --key-file or VEYNOD_KEY");
-      const { runRunner } = await import("./runner.mjs");
+      return await runComputerForeground(options);
+    } catch (error) {
+      process.stderr.write(`\n  ${red("✗")} ${error.message}\n\n`);
+      return 1;
+    }
+  }
+  if (["up", "hub", "doctor"].includes(options.command) && !options.help) {
+    try {
+      if (options.command === "up") return await up(options);
+      const hubModule = await import("./up.mjs");
+      if (options.command === "doctor") {
+        const checks = await hubModule.doctor();
+        printChecks(checks);
+        return hubModule.doctorOk(checks) ? 0 : 1;
+      }
+      const { runComputer } = await import("./veynod-messenger.mjs");
       const say = (text) => process.stderr.write(`  ${dim(new Date().toISOString())} ${text}\n`);
-      return await runRunner(options, { follow, version: VERSION, say });
+      return await hubModule.runHub(options, { listen: (opts) => listen(opts), runComputer,
+        version: VERSION, say });
     } catch (error) {
       process.stderr.write(`\n  ${red("✗")} ${error.message}\n\n`);
       return 1;
@@ -1077,7 +1546,7 @@ export async function main(argv = process.argv.slice(2)) {
   }
   if (options.command === "listen" && !options.help) {
     try {
-      return await listen(options);
+      return await listen({ ...options, managePid: true });
     } catch (error) {
       process.stderr.write(`\n  ${red("✗")} ${error.message}\n\n`);
       return 1;
