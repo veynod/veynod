@@ -21,11 +21,17 @@ const NODE_FOR_OAR = 24;
 
 // ------------------------------------------------------------------ files
 
-export function veynodDir(home = homedir()) {
+// Tests and CI set HOME to a throwaway tree; node's homedir() ignores HOME on
+// Windows (it prefers USERPROFILE), so honour VEYNOD_HOME/HOME explicitly.
+export function defaultHome() {
+  return process.env.VEYNOD_HOME || process.env.HOME || homedir();
+}
+
+export function veynodDir(home = defaultHome()) {
   return join(home, ".veynod");
 }
 
-export function configPath(home = homedir()) {
+export function configPath(home = defaultHome()) {
   return join(veynodDir(home), "config.json");
 }
 
@@ -37,11 +43,11 @@ export function agentName(value) {
   return clean.length >= 3 ? clean : `computer${clean ? `-${clean}` : ""}`;
 }
 
-export function keyPath(agentId, home = homedir()) {
+export function keyPath(agentId, home = defaultHome()) {
   return join(veynodDir(home), "keys", `${safeName(agentId)}.key`);
 }
 
-export function loadConfig(home = homedir()) {
+export function loadConfig(home = defaultHome()) {
   try {
     return JSON.parse(readFileSync(configPath(home), "utf8"));
   } catch {
@@ -56,12 +62,12 @@ function writePrivate(path, content) {
   chmodSync(path, 0o600);
 }
 
-export function saveConfig(config, home = homedir()) {
+export function saveConfig(config, home = defaultHome()) {
   writePrivate(configPath(home), `${JSON.stringify({ version: CONFIG_VERSION, ...config }, null, 2)}\n`);
   return configPath(home);
 }
 
-export function storeKey(agentId, key, home = homedir()) {
+export function storeKey(agentId, key, home = defaultHome()) {
   const path = keyPath(agentId, home);
   writePrivate(path, `${key}\n`);
   return path;
@@ -78,19 +84,48 @@ export function readKey(identity) {
  * connect, the clients to wire, the service to install and what the doctor
  * will check. `--dry-run` prints it; the tests read it.
  */
-export function upPlan(options, { home = homedir(), clients = [], name = hostname() } = {}) {
-  // Names are agent ids too (a letter, then letters, digits and dashes, at most
-  // 40 long), with room for the `-review` suffix.
+/**
+ * Identities the hub starts: the computer's own. A `-review` identity from an
+ * older setup stays parked in the config and is never started: the Kernel
+ * gate reviews code, and a person reviews what no other computer can.
+ */
+export function hubWorkers(config = {}) {
+  const identities = config.identities || [];
+  const workers = identities.filter((item) => item.role !== "review");
+  return workers.length ? workers : identities.slice(0, 1);
+}
+
+/**
+ * Which saved identities `up` reuses. One the plan wants is kept while its key
+ * file is there. One it no longer wants (the -review seat after going from
+ * --slots 2 to 1) is parked in the config instead of forgotten: the hub does
+ * not start it (hubWorkers), and asking for it again reuses its key rather than
+ * minting another `-review-2`, `-review-3`… identity on the board.
+ */
+export function reuseIdentities(plan, previous, { host, fresh = false, exists = existsSync } = {}) {
+  const usable = !fresh && previous?.host === host
+    ? (previous.identities || []).filter((item) => item?.key_file && exists(item.key_file)) : [];
+  const identities = [];
+  const missing = [];
+  for (const wanted of plan.identities) {
+    const kept = usable.find((item) => item.role === wanted.role);
+    if (kept) identities.push(kept);
+    else missing.push(wanted);
+  }
+  const parked = usable.filter((item) => !plan.identities.some((wanted) => wanted.role === item.role));
+  return { identities, missing, parked };
+}
+
+export function upPlan(options, { home = defaultHome(), clients = [], name = hostname() } = {}) {
+  // Names are agent ids too (a letter, then letters, digits and dashes, at most 40 long).
   const base = agentName(options.name || name);
   const identities = [{ role: "computer", label: base, wants_role: "EXECUTOR",
     why: "this computer's agent: your MCP clients and the hub use it" }];
-  if (options.runTasks) {
-    identities.push({ role: "review", label: `${base}-review`, wants_role: "AUDITOR",
-      why: "reviews what this computer built, so the Loop can finish a task here" });
-  }
   return {
     host: options.host,
     run_tasks: Boolean(options.runTasks),
+    slots: Number(options.slots || 1),
+    workers: 1,
     identities,
     clients,
     hub: {
@@ -106,7 +141,7 @@ export function upPlan(options, { home = homedir(), clients = [], name = hostnam
 // ------------------------------------------------------------------ hub
 
 /** One process per key: a second hub on the same key would fight for its one stream. */
-export function acquireLock(agentId, { home = homedir(), pid = process.pid, alive = isAlive } = {}) {
+export function acquireLock(agentId, { home = defaultHome(), pid = process.pid, alive = isAlive } = {}) {
   const path = join(veynodDir(home), `hub-${safeName(agentId)}.lock`);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   try {
@@ -141,8 +176,8 @@ function isAlive(pid) {
  * With run_tasks each identity runs as a runner (the scheduler places work and
  * reviews on it); otherwise each one listens, so pokes reach --exec hooks.
  */
-export async function runHub(options, { follow, listen, runRunner, version, say = () => {}, home = homedir(),
-  config = loadConfig(home) } = {}) {
+export async function runHub(options, { listen, runComputer, version, say = () => {}, home = defaultHome(),
+  config = loadConfig(home), forever = () => new Promise(() => {}) } = {}) {
   if (!config?.identities?.length) {
     throw new Error("no identities on this computer yet: run `npx veynod up` first");
   }
@@ -156,19 +191,24 @@ export async function runHub(options, { follow, listen, runRunner, version, say 
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   try {
-    const loops = config.identities.map((identity) => {
+    const workers = hubWorkers(config);
+    const loops = [];
+    for (const identity of workers) {
       releases.push(acquireLock(identity.agent_id, { home }));
       const key = readKey(identity);
-      const stateDir = join(veynodDir(home), "hub", safeName(identity.agent_id));
       const tag = (text) => say(`[${identity.agent_id}] ${text}`);
       if (config.run_tasks) {
-        return runRunner({ host, key, runtime: config.runtime || "", exec: config.exec || "",
-          slots: config.slots || 1, repos: config.repos || [], diskMb: config.disk_mb || 5120,
-          gitBase: config.git_base || "https://github.com/" },
-        { follow, version, say: tag, stateDir });
+        // Work arrives only over the nerve socket the messenger holds.
+        const messenger = await runComputer({ host, key, agent: identity.agent_id,
+          runtime: config.runtime || "", exec: config.exec || "", slots: config.slots || 1,
+          repos: config.repos || [], ...(config.deploy ? { deploy: config.deploy } : {}) },
+        { version, say: tag });
+        releases.push(() => messenger.stop());
+        loops.push(forever());
+      } else {
+        loops.push(listen({ host, key, exec: config.exec || "", heartbeat: true }, tag));
       }
-      return listen({ host, key, exec: config.exec || "", heartbeat: true }, tag);
-    });
+    }
     const results = await Promise.all(loops);
     return results.some((code) => code) ? 1 : 0;
   } finally {
@@ -194,7 +234,7 @@ const onPath = (run, command) => commandWorks(command, { run }) !== null;
  * What is missing on this computer and on the board, one line each:
  * {id, ok, required, text, fix}. `up` exits non-zero while a required item is red.
  */
-export async function doctor({ home = homedir(), config = loadConfig(home), fetchImpl = fetch,
+export async function doctor({ home = defaultHome(), config = loadConfig(home), fetchImpl = fetch,
   run = execFileSync, nodeVersion = process.versions.node, serviceInstalled } = {}) {
   const checks = [];
   const add = (id, ok, required, text, fix = null) => checks.push({ id, ok: Boolean(ok), required, text, fix });
@@ -204,24 +244,27 @@ export async function doctor({ home = homedir(), config = loadConfig(home), fetc
   }
   add("config", true, true, `Connected to ${config.host}.`);
   let computerKey = null;
+  // A parked identity (not started by the hub) cannot make the doctor red.
+  const started = new Set(hubWorkers(config).map((item) => item.agent_id));
   for (const identity of config.identities || []) {
+    const required = started.has(identity.agent_id);
     let key = null;
     try {
       key = readKey(identity);
     } catch {
-      add(`key:${identity.agent_id}`, false, true, `The key for ${identity.agent_id} is missing.`,
+      add(`key:${identity.agent_id}`, false, required, `The key for ${identity.agent_id} is missing.`,
         "Run `npx veynod up` again to reconnect.");
       continue;
     }
     if (identity.role === "computer") computerKey = key;
     try {
       const who = await getJson(fetchImpl, `${config.host}/v1/whoami`, key);
-      add(`key:${identity.agent_id}`, who.status === 200, true,
+      add(`key:${identity.agent_id}`, who.status === 200, required,
         who.status === 200 ? `${identity.agent_id} is accepted by the board.`
           : `The board refused ${identity.agent_id} (HTTP ${who.status}).`,
         who.status === 200 ? null : "The key was revoked or expired: run `npx veynod up` again.");
     } catch (error) {
-      add(`key:${identity.agent_id}`, false, true, `Veynod at ${config.host} did not answer (${error.message}).`,
+      add(`key:${identity.agent_id}`, false, required, `Veynod at ${config.host} did not answer (${error.message}).`,
         "Check the network or --host.");
     }
   }
@@ -230,12 +273,19 @@ export async function doctor({ home = homedir(), config = loadConfig(home), fetc
     major >= NODE_FOR_OAR ? `Node ${nodeVersion}: OAR can drive the runtimes.`
       : `Node ${nodeVersion}: below ${NODE_FOR_OAR}, so OAR is unavailable and the runtime's CLI is used.`,
     major >= NODE_FOR_OAR ? null : `Install Node ${NODE_FOR_OAR} or newer for OAR (quota-aware, pinned sessions).`);
-  if (config.run_tasks) {
-    const roles = new Set((config.identities || []).map((item) => item.role));
-    add("reviewer", roles.has("review"), true,
-      roles.has("review") ? "A second identity reviews what this computer builds."
-        : "No reviewer identity: a task built here cannot be reviewed here.",
-      roles.has("review") ? null : "Run `npx veynod up --run-tasks` again and approve the review code.");
+  if (config.run_tasks && config.deploy) {
+    // A deploy computer: docker and its compose directory, no agent runtime.
+    const docker = onPath(run, "docker");
+    add("docker", docker, true, docker ? "docker is installed." : "docker is missing.",
+      docker ? null : "Install Docker with the compose plugin (`docker compose version`).");
+    const dir = config.deploy.dir;
+    const there = Boolean(dir) && existsSync(join(dir, config.deploy.file || "docker-compose.yml"));
+    add("compose", there, true, there ? `Deploys run in ${dir}.`
+      : `No compose file ${config.deploy.file || "docker-compose.yml"} in ${dir || "(no directory)"}.`,
+    there ? null : "Run `veynod up --deploy --compose-dir DIR --compose-file FILE` with the right path.");
+  } else if (config.run_tasks) {
+    add("reviewer", true, false,
+      "The Kernel gate reviews code built here; a person reviews what no other computer can.");
     // No saved runtime means the hub uses whichever is here.
     const wanted = config.runtime ? [config.runtime] : ["claude", "codex"];
     const runtime = config.runtime === "custom" ? "custom" : wanted.find((id) => onPath(run, id));
