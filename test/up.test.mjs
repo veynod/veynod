@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { acquireLock, agentName, doctor, doctorOk, hubWorkers, installStableCopy, keyPath, loadConfig, pruneStableCopies, reuseIdentities, saveConfig, stableDir, storeKey, upPlan, withEarlierChoices } from "../bin/up.mjs";
+import { acquireLock, agentName, doctor, doctorOk, dropRefusedKeys, hubWorkers, installStableCopy, keyPath, loadConfig, pruneStableCopies, reuseIdentities, saveConfig, stableDir, storeKey, upPlan, withEarlierChoices } from "../bin/up.mjs";
 import { connect, parseArgs, sealForTest, servicePlan, settledDoctor } from "../bin/veynod.mjs";
 
 test("up plans one identity per computer, whatever the slots", () => {
@@ -282,11 +282,18 @@ test("run from the npx cache, up keeps its own copy for the service, OAR include
   writeFileSync(join(modules, "veynod", "bin", "veynod.mjs"), "// cli");
   mkdirSync(join(modules, "@botiverse", "oar"), { recursive: true });
   writeFileSync(join(modules, "@botiverse", "oar", "index.js"), "// oar");
+  // npm hoists OAR's own dependencies beside it; OAR does not load without them.
+  mkdirSync(join(modules, "@agentclientprotocol", "sdk"), { recursive: true });
+  writeFileSync(join(modules, "@agentclientprotocol", "sdk", "index.js"), "// acp");
+  mkdirSync(join(modules, "which"), { recursive: true });
+  writeFileSync(join(modules, "which", "index.js"), "// which");
 
   const script = installStableCopy(join(modules, "veynod", "bin", "veynod.mjs"), { version: "9.9.9", home });
   assert.equal(script, join(stableDir("9.9.9", home), "node_modules", "veynod", "bin", "veynod.mjs"));
   assert.equal(readFileSync(script, "utf8"), "// cli");
   assert.ok(existsSync(join(stableDir("9.9.9", home), "node_modules", "@botiverse", "oar", "index.js")));
+  assert.ok(existsSync(join(stableDir("9.9.9", home), "node_modules", "@agentclientprotocol", "sdk", "index.js")));
+  assert.ok(existsSync(join(stableDir("9.9.9", home), "node_modules", "which", "index.js")));
   assert.ok(!script.includes("_npx"));
 
   // An upgrade installs the new version beside it; the old one goes once the service runs the new.
@@ -330,4 +337,35 @@ test("the doctor fails a computer that only stays online but has no background s
   assert.equal(doctorOk(checks), false);
   const fine = await doctor({ home, config, serviceInstalled: () => true, nodeVersion: "24.0.0" });
   assert.equal(doctorOk(fine), true);
+});
+
+test("a saved key the board refuses is asked for again, not reported as connected", async () => {
+  // The owner revoked the computer's key: `npx veynod` said "already connected"
+  // and the doctor said "refused, run npx veynod again", round and round.
+  const plan = { identities: [{ role: "computer", label: "home-cursor", wants_role: "EXECUTOR" }] };
+  const reused = {
+    identities: [{ role: "computer", agent_id: "home-cursor", key_file: "a" }],
+    missing: [],
+    parked: [{ role: "review", agent_id: "windows-home", key_file: "b" }],
+  };
+  const keys = { a: "agt_revoked", b: "agt_also_revoked", c: "agt_good" };
+  const fetchImpl = async (_url, init) => ({
+    status: init.headers.Authorization === "Bearer agt_good" ? 200 : 401,
+    json: async () => ({}),
+  });
+  const readKeyFile = (identity) => keys[identity.key_file];
+  const out = await dropRefusedKeys(reused, plan, { host: "https://veynod.test", fetchImpl, readKeyFile });
+  assert.deepEqual(out.identities, []);
+  assert.deepEqual(out.missing, [plan.identities[0]]);
+  assert.deepEqual(out.parked, []);
+  assert.deepEqual(out.refused, ["home-cursor", "windows-home"]);
+
+  // An accepted key stays; an unreachable board is not a reason to re-approve.
+  const fine = await dropRefusedKeys({ identities: [{ role: "computer", agent_id: "x", key_file: "c" }],
+    missing: [], parked: [] }, plan, { host: "https://veynod.test", fetchImpl, readKeyFile });
+  assert.equal(fine.identities.length, 1);
+  const offline = await dropRefusedKeys(reused, plan, { host: "https://veynod.test", readKeyFile,
+    fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
+  assert.equal(offline.identities.length, 1);
+  assert.deepEqual(offline.refused, []);
 });

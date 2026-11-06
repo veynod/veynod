@@ -90,20 +90,22 @@ export function stableDir(version, home = defaultHome()) {
 }
 
 /**
- * Copies this package (and OAR next to it, when npx installed it) to
- * ~/.veynod/cli/<version>/node_modules/ and returns the copy's veynod.mjs.
- * Nothing to install first: `npx veynod` alone sets up a service that lasts.
+ * Copies npx's install of this package to ~/.veynod/cli/<version>/node_modules/
+ * and returns the copy's veynod.mjs. Nothing to install first: `npx veynod`
+ * alone sets up a service that lasts.
+ *
+ * The whole npx node_modules goes, not only veynod and @botiverse/oar: npm
+ * hoists OAR's own dependencies (the ACP SDK, pi, undici, which…) beside it.
+ * Without them OAR failed to load in the service, which then ran Codex through
+ * its CLI without the computer's key (mcp_pinning false, claims refused). That
+ * directory is npx's own for this package: veynod's dependency tree, nothing else.
  */
-export function installStableCopy(script, { version, home = defaultHome(), fs = { cpSync, existsSync, mkdirSync } } = {}) {
+export function installStableCopy(script, { version, home = defaultHome(), fs = { cpSync, mkdirSync } } = {}) {
   const packageDir = dirname(dirname(script)); // …/node_modules/veynod
   const modules = dirname(packageDir); // …/node_modules
   const target = join(stableDir(version, home), "node_modules");
   fs.mkdirSync(target, { recursive: true, mode: 0o700 });
-  fs.cpSync(packageDir, join(target, basename(packageDir)), { recursive: true, force: true });
-  const oar = join(modules, "@botiverse", "oar");
-  if (fs.existsSync(oar)) {
-    fs.cpSync(oar, join(target, "@botiverse", "oar"), { recursive: true, force: true });
-  }
+  fs.cpSync(modules, target, { recursive: true, force: true });
   return join(target, basename(packageDir), "bin", basename(script));
 }
 
@@ -184,6 +186,43 @@ export function withEarlierChoices(options, previous) {
     repos: [...new Set([...(previous.repos || []), ...(options.repos || [])])],
     decided: true,
   };
+}
+
+/**
+ * Keeps only saved identities whose key the board still accepts. A key that
+ * was revoked or expired answers 401/403: that identity goes back to the plan's
+ * missing list, so this run asks for a new key instead of saying "already
+ * connected" while the doctor says the key is refused. A network error keeps
+ * the identity (no new approval just because the board was unreachable).
+ */
+export async function dropRefusedKeys(reused, plan, { host, fetchImpl = fetch, readKeyFile = readKey } = {}) {
+  const refused = [];
+  const accepted = async (identity) => {
+    try {
+      const { status } = await getJson(fetchImpl, `${host}/v1/whoami`, readKeyFile(identity));
+      return status !== 401 && status !== 403;
+    } catch {
+      return true;
+    }
+  };
+  const identities = [];
+  const missing = [...reused.missing];
+  for (const identity of reused.identities) {
+    if (await accepted(identity)) {
+      identities.push(identity);
+      continue;
+    }
+    refused.push(identity.agent_id);
+    const wanted = plan.identities.find((item) => item.role === identity.role);
+    if (wanted && !missing.includes(wanted)) missing.push(wanted);
+  }
+  // A parked identity whose key is refused is of no use: forget it.
+  const parked = [];
+  for (const identity of reused.parked) {
+    if (await accepted(identity)) parked.push(identity);
+    else refused.push(identity.agent_id);
+  }
+  return { identities, missing, parked, refused };
 }
 
 export function upPlan(options, { home = defaultHome(), clients = [], name = hostname() } = {}) {
